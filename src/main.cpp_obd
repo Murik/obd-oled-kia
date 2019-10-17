@@ -1,0 +1,226 @@
+#include <Arduino.h>
+
+/************************************************************************************************* 
+  OBD-II_PIDs TEST CODE
+  LOOVEE @ JUN24, 2017
+  
+  Query
+  send id: 0x7df
+      dta: 0x02, 0x01, PID_CODE, 0, 0, 0, 0, 0
+
+  Response
+  From id: 0x7E9 or 0x7EA or 0x7EB
+      dta: len, 0x41, PID_CODE, byte0, byte1(option), byte2(option), byte3(option), byte4(option)
+      
+  https://en.wikipedia.org/wiki/OBD-II_PIDs
+  
+  Input a PID, then you will get reponse from vehicle, the input should be end with '\n'
+***************************************************************************************************/
+#include <SPI.h>
+#include "mcp_can.h"
+
+// the cs pin of the version after v1.1 is default to D9
+// v0.9b and v1.0 is default D10
+const int SPI_CS_PIN = 10;
+#define CAN0_INT 2                              // Set INT to pin 2
+
+MCP_CAN CAN(SPI_CS_PIN);                                    // Set CS pin
+
+#define PID_ENGIN_PRM       0x0C
+#define PID_VEHICLE_SPEED   0x0D
+#define PID_COOLANT_TEMP    0x05
+
+#define CAN_ID_PID          0x7DF
+
+uint8_t pids[2];
+unsigned char getPid    = 0;
+char msgString[128];
+
+const byte numChars = 4;
+char receivedChars[4];
+
+void set_mask_filt()
+{
+    /*
+     * set mask, set both the mask to 0x3ff
+     */
+    // CAN.init_Mask(0, 0, 0x7FC);
+    // CAN.init_Mask(1, 0, 0x7FC);
+
+    /*
+     * set filter, we can receive id from 0x04 ~ 0x09
+     */
+    // CAN.init_Filt(0, 0, 0x7E8);                 
+    // CAN.init_Filt(1, 0, 0x7E8);
+
+//   CAN.init_Mask(0, 0, 0x7FF);
+//   CAN.init_Mask(1, 0, 0x7FF);
+//   CAN.init_Filt(0, 0, 0x260); 
+//   CAN.init_Filt(1, 0, 0x260);
+//   CAN.init_Filt(2, 0, 0x260);
+//   CAN.init_Filt(3, 0, 0x260);
+//   CAN.init_Filt(4, 0, 0x260);
+//   CAN.init_Filt(5, 0, 0x260);
+
+
+  CAN.init_Mask(0, 0, 0x07FF);                // Init first mask...
+  CAN.init_Filt(0, 0, 0x07E8);                // Init first filter... (for Oil temp read)
+  CAN.init_Filt(1, 0, 0x07E8);                // Init second filter...(for Oil temp read)
+  
+  CAN.init_Mask(1, 0, 0x07FF);                // Init second mask... 
+  CAN.init_Filt(2, 0, 0x07E8);
+  CAN.init_Filt(3, 0, 0x0260);
+  CAN.init_Filt(4, 0, 0x0316); 
+  CAN.init_Filt(5, 0, 0x043F);
+//   CAN0.init_Filt(2,0,0x07E80000);                // Init third filter...(ECU params read - RPM, Speed....)
+//   CAN0.init_Filt(3,0,0x01000000);                // Init fouth filter...(for Radio read)
+//   CAN0.init_Filt(4,0,0x01090000);                // Init fifth filter...(for Radio read)
+//   CAN0.init_Filt(5,0,0x01040000);
+}
+
+void sendPid(uint8_t *pid)
+{
+    unsigned char tmp[8] = {0x02, pid[0], pid[1], 0, 0, 0, 0, 0};
+    Serial.print("SEND PID:");
+    for(byte i = 0; i<2; i++){
+        sprintf(msgString, " 0x%02X", pid[i]);
+        Serial.print(msgString);
+    }
+    Serial.println();
+    CAN.sendMsgBuf(CAN_ID_PID, 0, 8, tmp);
+}
+// void sendPid(unsigned char __pid0, unsigned char __pid1)
+// {
+//     unsigned char tmp[8] = {0x02, __pid0, __pid1, 0, 0, 0, 0, 0};
+//     CAN.sendMsgBuf(CAN_ID_PID, 0, 8, tmp);
+// }
+
+void setup()
+{
+    Serial.begin(115200);
+    while (CAN_OK != CAN.begin(CAN_500KBPS,MCP_8MHz))    // init can bus : baudrate = 500k
+    {
+        Serial.println("CAN BUS Shield init fail");
+        Serial.println(" Init CAN BUS Shield again");
+        delay(100);
+          CAN.setMode(MODE_NORMAL);                     // Set operation mode to normal so the MCP2515 sends acks to received data.
+          pinMode(CAN0_INT, INPUT);                            // Configuring pin for /INT input
+    }
+    Serial.println("CAN BUS Shield init ok!");
+    set_mask_filt();
+}
+
+void taskCanRecv()
+{
+    unsigned char len = 0;
+    unsigned char buf[8];
+
+    if(CAN_MSGAVAIL == CAN.checkReceive())                   // check if get data
+    {
+        CAN.readMsgBuf(&len, buf);    // read data,  len: data length, buf: data buf
+
+if(CAN.getCanId() == 0x7E8||CAN.getCanId() == 0x260||CAN.getCanId() == 0x43F||CAN.getCanId() == 0x316){
+        sprintf(msgString, "Standard ID: 0x%.3lX  DLC: %1d  Data:", CAN.getCanId(), len);
+        Serial.print(msgString);
+        for(int i = 0; i<len; i++)    // print the data
+        {
+          sprintf(msgString, " 0x%02X", buf[i]);
+            Serial.print(msgString);
+        }
+        Serial.println();
+        }
+    }
+}
+
+// void taskDbg()
+// {
+//     while(Serial.available())
+//     {
+//         char c = Serial.read();
+        
+//         if(c>='0' && c<='9')
+//         {
+//             PID_INPUT *= 0x10;
+//             PID_INPUT += c-'0';
+            
+//         }
+//         else if(c>='A' && c<='F')
+//         {
+//             PID_INPUT *= 0x10;
+//             PID_INPUT += 10+c-'A';
+//         }
+//         else if(c>='a' && c<='f')
+//         {
+//             PID_INPUT *= 0x10;
+//             PID_INPUT += 10+c-'a';
+//         }
+//         else if(c == '\n')      // END
+//         {
+//             getPid = 1;
+//         }
+//     }
+// }
+
+uint8_t* hex_decode(const char *in, size_t len,uint8_t *out)
+{
+        unsigned int i, t, hn, ln;
+
+        for (t = 0,i = 0; i < len; i+=2,++t) {
+
+                hn = in[i] > '9' ? in[i] - 'A' + 10 : in[i] - '0';
+                ln = in[i+1] > '9' ? in[i+1] - 'A' + 10 : in[i+1] - '0';
+
+                out[t] = (hn << 4 ) | ln;
+        }
+
+        return out;
+}
+
+void recvWithEndMarker() {
+  //reset buffer
+  memset(&receivedChars, 0, 4);
+
+  //create variables
+  static byte ndx = 0;
+  char endMarker = '\n';
+  char rc;
+  delay(500);
+
+  //while data is available read
+  while (Serial.available() > 0) {
+    rc = Serial.read();
+
+    //if the end then stop
+    if (rc != endMarker) {
+      receivedChars[ndx] = rc;
+      ndx++;
+      if (ndx >= numChars) {
+        ndx = numChars - 1;
+      }
+    }
+    
+    else {
+        hex_decode(receivedChars,strlen(receivedChars),pids);
+    //   receivedChars[ndx] = '\0'; // terminate the string
+      ndx = 0;
+      getPid = 1;
+    }
+  }
+}   
+
+
+void loop()
+{
+    taskCanRecv();
+    if(Serial.available() > 0){
+        recvWithEndMarker();
+    }
+    
+    if(getPid)          // GET A PID
+    {
+        getPid = 0;
+        sendPid(pids);
+        // PID_INPUT = 0;
+    }
+}
+// END FILE

@@ -1,0 +1,389 @@
+#include <Arduino.h>
+//Kia Ceed Upper Display indication
+
+#include "mcp_can.h"
+#include <SPI.h>
+#include <stdio.h>
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+
+#define OBDRate1    371             //ReadOBD rate (for fast changing parameters) real time 371ms
+#define OBDRate2    795             //ReadOBD rate (for slow changing parameters) real time 795ms *3 - read only one parameter at a time
+unsigned char flagRecv = 0;         //it is set when new data over the can is recieved (used by ChekDataRadio())
+
+
+//Global Variables Containing the OBD Parameters
+int EngOil = 140;                   // Engine Oil Temperature (PID = 0x01 from block 21 - 2101) 
+float EngLoad = 6.3;               // Engine Load (PID = 0x04)
+int EngCool = 89;                   // Engine Coolant Temperature (PID = 0x05)
+unsigned int EngRPM = 3359;         // Engine RPM (PID = 0C)
+unsigned int Speed = 127;           // Speed (PID = 0D)
+char TmAdvance = -5;                // Timing advance (PID = 0E)
+float BrdVoltage = 14.3;            //Voltage in a Board net (PID = 0x42)
+
+//Used PIDs 
+#define PID_OIL_TEMP        0x01    //(PID 2101)
+#define PID_ENGIN_LOAD      0x04    //(PID 0104)
+#define PID_COOLANT_TEMP    0x05    //(PID 0105)
+#define PID_ENGIN_PRM       0x0C    //(PID 010C)
+#define PID_VEHICLE_SPEED   0x0D    //(PID 010D)
+#define PID_TIMING_ADVANCE  0x0E    //(PID 010E)
+#define PID_BOARD_VOLTAGE   0x42    //(PID 0142)
+
+//USED CAN ID (ECU ID)
+#define CAN_ID_PID         0x7DF
+
+//CAN Shield definitions
+#define CAN0_INT 2            // Set INT to pin 2
+// #define MCP2551_Rs    5      //Pin PD5 - to be used to set the mode of MCP2551(CAN Driver) - Rs input
+const int SPI_CS_PIN = 10;
+
+
+//Global Timer Flag 1ms
+unsigned char TmFlg;
+unsigned char TmFlg1ms;
+
+//define the pin where the button is connected (D3)
+// #define But     3
+
+char NoDataCounter;           //conts the missing data attempts (used to put MCU to sleep)
+
+//Debug option
+boolean toggle = false;
+
+
+MCP_CAN CAN0(SPI_CS_PIN);     // Set CS pin for the MCP2515
+
+
+void setup()
+{
+    // wdt_disable();
+    // noInterrupts();
+    Serial.begin(115200);
+    
+    //to be able to filter data corectrly have to be in MCP_STDEX mode
+    while (CAN_OK != CAN0.begin(CAN_500KBPS, MCP_8MHz))              // init can bus : baudrate = 500k
+    {
+        Serial.println("CAN BUS Shield init fail");
+        Serial.println(" Init CAN BUS Shield again");
+        delay(100);
+    }
+    Serial.println("CAN BUS Shield init ok!");
+    
+    pinMode(CAN0_INT, INPUT);                           // Configuring pin for /INT input
+    //set_mask_filt_ECU();                                 //Set the standard masks and filters
+    set_mask_filt();
+    CAN0.setMode(MODE_NORMAL);                           // Change to normal mode to allow messages to be transmitted
+
+    // initialize timer1
+    noInterrupts();           // disable all interrupts
+    TCCR1A = 0;
+    TCCR1B = 0;
+
+    TCNT1 = 63535;            // preload timer 65536-16MHz/256/2Hz
+    TCCR1B |= (1 << CS11);    // 256 prescaler
+    TIMSK1 |= (1 << TOIE1);   // enable timer overflow interrupt
+
+    //initialize Digital input D3
+    // pinMode(But, INPUT_PULLUP);
+
+    //initialize Mode select Output for MCP2551 (Driver)
+    // pinMode(MCP2551_Rs, OUTPUT); 
+    // digitalWrite(MCP2551_Rs,LOW);     // Set Rs pin to Low (High Speed operation)                            
+ 
+    // attachInterrupt(digitalPinToInterrupt(But), But_ISR, FALLING); // wakeUpNow when Button gets FALLING edge
+    NoDataCounter = 0;                                                            
+
+    attachInterrupt(digitalPinToInterrupt(CAN0_INT), MCP2515_ISR, FALLING);        // start interrupt from MCP2515
+    
+    interrupts();             // enable all interrupts
+
+    // RadioDispFLG=0;
+    
+    // pinMode(4, OUTPUT);                                //only debug 
+}
+
+void MCP2515_ISR()
+{
+  flagRecv = 1;
+}
+
+
+// void But_ISR()
+// {
+//       DispMode++;
+//       if(DispMode>4)
+//       DispMode=0;
+// }
+
+
+ISR(TIMER1_OVF_vect)       
+{
+  TCNT1 = 63535;            // preload timer
+  
+  TmFlg=1;
+  
+}
+
+
+void ScanTimer()
+{
+  if(TmFlg==1)
+    {
+      TmFlg1ms=1;
+      TmFlg=0;
+    }
+    else
+      TmFlg1ms=0;
+}
+
+void loop()
+  {
+  ScanTimer();
+
+  ReadOBD();
+  if(NoDataCounter>20)    //if data was not recieved 20 times -> sleep
+    {
+    detachInterrupt(digitalPinToInterrupt(CAN0_INT));
+    
+    // Reset Manualy the MCP2515 CAN Controller
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(SPI_CS_PIN, LOW);
+    SPI.transfer(0xC0);               //Send "MCP_RESET"
+    digitalWrite(SPI_CS_PIN, HIGH);
+    SPI.endTransaction();
+    delayMicroseconds(10);
+    
+    //Put CAN Controller in Sleep Mode
+    CAN0.setMode(MODE_SLEEP);               // Change to sleep mode to save energy
+    
+    // digitalWrite(MCP2551_Rs,HIGH);        // Set Rs pin to High, Put MCP2551 in Standby mode
+    sleepNow();                            //Put AtMega328P to sleep
+    }
+  
+  TmFlg1ms=0;                             //clear the 1ms Flag
+  
+}
+
+
+
+void sleepNow()         // here we put the arduino to sleep
+{
+    /* Now is the time to set the sleep mode. In the Atmega8 datasheet
+     * http://www.atmel.com/dyn/resources/prod_documents/doc2486.pdf on page 35
+     * there is a list of sleep modes which explains which clocks and
+     * wake up sources are available in which sleep mode.
+     *
+     * In the avr/sleep.h file, the call names of these sleep modes are to be found:
+     *
+     * The 5 different modes are:
+     *     SLEEP_MODE_IDLE         -the least power savings
+     *     SLEEP_MODE_ADC
+     *     SLEEP_MODE_PWR_SAVE
+     *     SLEEP_MODE_STANDBY
+     *     SLEEP_MODE_PWR_DOWN     -the most power savings
+     *
+     * For now, we want as much power savings as possible, so we
+     * choose the according
+     * sleep mode: SLEEP_MODE_PWR_DOWN
+     *
+     */  
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);   // sleep mode is set here
+     
+ 
+    sleep_enable();          // enables the sleep bit in the mcucr register
+                             // so sleep is possible. just a safety pin
+                             
+    sleep_mode();            // here the device is actually put to sleep!!
+                             // THE PROGRAM CONTINUES FROM HERE AFTER WAKING UP
+ 
+    sleep_disable();         // first thing after waking from sleep:
+                             // disable sleep...
+    
+    noInterrupts();
+    // detachInterrupt(digitalPinToInterrupt(But));    //"Disable" the interrupt from the button (It will be enabled during the "reset")
+    wdt_enable(WDTO_1S);
+    delay(1000);                //stay here till RESET comes
+    
+}
+
+
+void set_mask_filt()
+{
+   
+  //For Masks - when 0000 everything from this addres is alowed
+  CAN0.init_Mask(0,0,0x07FFFF00);                // Init first mask...
+  CAN0.init_Filt(0,0,0x07E81001);                // Init first filter... (for Oil temp read)
+  CAN0.init_Filt(1,0,0x07E82501);                // Init second filter...(for Oil temp read)
+  
+  CAN0.init_Mask(1,0,0x07FF0000);                // Init second mask... 
+  CAN0.init_Filt(2,0,0x07E80000);                // Init third filter...(ECU params read - RPM, Speed....)
+  CAN0.init_Filt(3,0,0x07E80000);                // Init fouth filter...(for Radio read)
+  CAN0.init_Filt(4,0,0x07E80000);                // Init fifth filter...(for Radio read)
+  CAN0.init_Filt(5,0,0x07E80000);                // Init sixth filter...(for Radio read)
+}
+
+//************** Routine to form the CAN PID question and send it *********//
+void sendPid(unsigned char __pid0, unsigned char __pid1)
+{
+    unsigned char tmp[8] = {0x02, __pid0, __pid1, 0, 0, 0, 0, 0};
+    CAN0.sendMsgBuf(CAN_ID_PID, 0, 8, tmp);
+}
+
+
+//*************** Routine to read OBD Parameters **************
+//Read some paramethers OBDRate1 times slower than update display
+//Read other parameters OBDRate2 times slower 
+void ReadOBD (void)
+{ 
+ static unsigned int ReadOBDTm0;
+ static unsigned int ReadOBDTm1;
+ static unsigned char IdxSlowRead;
+
+  if(TmFlg1ms==1)
+    {
+      ReadOBDTm0++;
+      ReadOBDTm1++;
+    }
+ 
+  if(ReadOBDTm0>OBDRate1)
+    {
+    ReadOBDTm0=0;
+    
+        sendPid(0x01,PID_ENGIN_PRM);         //send request for the Engine RPM 
+        taskCanRecv();
+        sendPid(0x01,PID_VEHICLE_SPEED);     //send request for the speed
+        taskCanRecv();
+        sendPid(0x01,PID_TIMING_ADVANCE);     //send request for the Timing Advance 
+        taskCanRecv();
+
+        sendPid(0x01,PID_ENGIN_LOAD);     //send request for Engine Load 
+        taskCanRecv();
+    }
+  else if(ReadOBDTm1>OBDRate2)
+    {
+    ReadOBDTm1=0;
+    
+    switch (IdxSlowRead) {
+      
+      case 0:
+        sendPid(0x01,PID_COOLANT_TEMP);  //send request for Coolant temperature
+        taskCanRecv();
+        IdxSlowRead=1;
+      break;
+
+      case 1:
+         sendPid(0x01,PID_BOARD_VOLTAGE); //send request for Board Voltage 
+         taskCanRecv();
+         IdxSlowRead=2;
+      break;
+
+      case 2:
+         sendPid(0x21,PID_OIL_TEMP);      //send request for Engine Oil Temparature
+         taskCanRecvOil();
+         IdxSlowRead=0;
+      break;
+
+      default:
+        // if nothing else matches, do the default
+        // default is optional
+        IdxSlowRead=0;
+      break;
+    }
+  
+  }
+}
+
+
+//***************** Routine to read the recieved mesage form block 01XX from ECU *******************
+//*********** also update directly the global variable for corresponding parameter *****************
+void taskCanRecv(void)
+{
+    long unsigned int rxId;
+    unsigned char len = 0;
+    unsigned char buf[8];
+    unsigned int timeout = 0;
+    unsigned char DoneFL = 0;     //flag for done reading
+
+    
+    //stay in for certan time or till the mesage is recieved (DoneFL)
+     do
+      {
+      timeout++;
+      if(CAN_MSGAVAIL == CAN0.checkReceive())                   // check if get data
+        {
+          CAN0.readMsgBuf(&rxId, &len, buf);    // read data,  len: data length, buf: data buf
+
+          if(rxId == 0x7E8)
+            {
+              //RadioDispFLG = 0;
+              switch(buf[2])
+                {
+                case PID_ENGIN_LOAD:
+                   EngLoad = buf[3]/2.55;  
+                break;
+                case PID_COOLANT_TEMP:
+                    EngCool = buf[3]-40;  
+                break;
+                case PID_ENGIN_PRM:
+                    EngRPM = ((buf[3]*256)+buf[4])/4;  
+                break;
+                case PID_BOARD_VOLTAGE:
+                    BrdVoltage = ((buf[3]*256)+buf[4])/1000.0;  
+                break;
+                case PID_VEHICLE_SPEED:
+                    Speed = buf[3];  
+                break;
+                case PID_TIMING_ADVANCE:
+                   TmAdvance = ((buf[3]/2)-64);  
+                break;
+                }
+              DoneFL=1;   //set flag for done reading
+            }   
+      }
+    }
+    while((timeout < 4000) && (DoneFL < 1));  //do till the time out expire or the data is recieved
+    if(timeout > 3900)                        //chek if it was recieved data
+      NoDataCounter++;                        //not recieved increase the conter
+    else
+      NoDataCounter = 0;                      //recieved => zero the counter
+}
+
+
+
+//***************** Routine to read the recieved mesage form block 2101 from ECU *******************
+//******************************** used to read the Oil Temperature ********************************
+void taskCanRecvOil(void)
+{
+    long unsigned int rxId;
+    unsigned char len = 0;
+    unsigned char buf[8];
+    unsigned int timeout = 0;
+    unsigned char DoneFL = 0;
+    
+    do
+      {
+      timeout++;
+      if(CAN_MSGAVAIL == CAN0.checkReceive())                   // check if get data
+        {
+          CAN0.readMsgBuf(&rxId, &len, buf);      // read data,  len: data length, buf: data buf
+          if(rxId == 0x7E8)
+            {
+            if(buf[0]== 0x10)                       //chek if it is the correct answer (FB= 0x10)
+              {                                    //it is correct
+              unsigned char tmp[8] = {0x30, 0, 0, 0, 0, 0, 0, 0};      
+              CAN0.sendMsgBuf(0x7E0, 0, 8, tmp);   //send the request to send the res of the data (in total 50 bytes)              
+              }
+            //after sending the request now we sniff for corect pacage (0x25)
+            if(buf[0]== 0x25)   //Chek if it is the correct answer (Firs Byte = 0x25)
+              {
+              EngOil = buf[2]; //Read the Engine oil byte (I suspect that this is the correct byte, not 100% sure yet)
+              DoneFL=1;         //set flag for done reading
+              }
+            }
+        }
+       //after sending the request now we sniff for corect pacage (0x25)
+    }
+    while((timeout < 4000) && (DoneFL < 1));      //do till the time out expire or the data is recieved 
+}
+
